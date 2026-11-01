@@ -14,6 +14,7 @@ import librosa
 import io
 import time
 import os
+import traceback
 import tensorflow as tf
 
 app = FastAPI(title="Infant Cry Classification API")
@@ -21,9 +22,9 @@ app = FastAPI(title="Infant Cry Classification API")
 # Enable CORS for your Hostinger frontend and local testing
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows requests from any origin (Hostinger domain, localhost, etc.)
+    allow_origins=["*"],  # Allows requests from any origin
     allow_credentials=True,
-    allow_methods=["*"],  # Allows GET, POST, OPTIONS, etc.
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -53,15 +54,15 @@ async def predict_cry(file: UploadFile = File(...)):
         contents = await file.read()
         audio_file = io.BytesIO(contents)
 
-        # Load audio using librosa (resample to 16kHz standard or match training SR)
+        # Load audio using librosa (resample to 16kHz standard)
         y, sr = librosa.load(audio_file, sr=16000)
 
-        # Extract Log-Mel Spectrogram (Matching training feature extraction pipeline)
+        # Extract Log-Mel Spectrogram
         mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64, n_fft=2048, hop_length=512)
         log_mel_spec = librosa.power_to_db(mel_spectrogram, ref=np.max)
 
         # Normalize or pad/truncate to match model input shape requirement
-        expected_frames = input_details[0]['shape'][2] # Adjust index based on model dimensions [Batch, Height, Width, Channels]
+        expected_frames = input_details[0]['shape'][2]
 
         if log_mel_spec.shape[1] < expected_frames:
             pad_width = expected_frames - log_mel_spec.shape[1]
@@ -69,9 +70,9 @@ async def predict_cry(file: UploadFile = File(...)):
         else:
             log_mel_spec = log_mel_spec[:, :expected_frames]
 
-        # Reshape to match model input tensor (e.g., [1, 64, expected_frames, 1])
-        input_data = np.expand_dims(log_mel_spec, axis=-1)  # Add channel dimension
-        input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
+        # Reshape to match model input tensor
+        input_data = np.expand_dims(log_mel_spec, axis=-1)
+        input_data = np.expand_dims(input_data, axis=0)
 
         # Handle INT8 quantization input scaling if applicable
         if input_details[0]['dtype'] == np.int8:
@@ -111,4 +112,6 @@ async def predict_cry(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        # This will print the full error traceback to your Render logs
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
