@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import librosa
 import subprocess
+import json
 import time
 import os
 import traceback
@@ -11,20 +12,39 @@ import imageio_ffmpeg
 
 app = FastAPI(title="Infant Cry Classification API")
 
-# Enable CORS for Hostinger frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # must be False when allow_origins=["*"]
+    allow_credentials=False,  # must be False with allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Robust path resolution for Render environment
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "infant_cry_pathology_int8.tflite")
 
-# Bundled ffmpeg binary (installed via pip, no apt needed on Render)
+# If labels.json exists (produced by the multi-class training script), use its
+# model + class names. Otherwise fall back to the original binary model, where
+# training used 0 = Physiological, 1 = Pathological.
+CONFIG_PATH = os.path.join(BASE_DIR, "labels.json")
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH) as f:
+        _cfg = json.load(f)
+    MODEL_FILE = _cfg["model"]
+    LABELS = _cfg["labels"]
+else:
+    MODEL_FILE = "infant_cry_pathology_int8.tflite"
+    LABELS = ["Physiological", "Pathological"]
+
+MODEL_PATH = os.path.join(BASE_DIR, MODEL_FILE)
+
+# Must match training exactly
+SR = 16000
+DURATION = 3.0
+N_MELS = 64
+N_FFT = 2048
+HOP_LENGTH = 512
+TARGET_LEN = int(SR * DURATION)
+
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 interpreter = None
@@ -33,24 +53,17 @@ try:
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
-    print("TFLite Model loaded successfully.")
+    print(f"TFLite model loaded: {MODEL_FILE} | labels: {LABELS}")
 except Exception as e:
     print(f"Error loading TFLite model: {e}")
 
 
-def decode_audio(contents: bytes, sr: int = 16000) -> np.ndarray:
-    """Decode any browser audio format (webm/opus, ogg, mp4, wav) to mono float32 @ sr."""
+def decode_audio(contents: bytes) -> np.ndarray:
+    """Decode any browser audio format (webm/opus, ogg, mp4, wav) to mono float32 @ 16 kHz."""
     proc = subprocess.run(
-        [
-            FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
-            "-i", "pipe:0",
-            "-f", "f32le", "-acodec", "pcm_f32le",
-            "-ac", "1", "-ar", str(sr),
-            "pipe:1",
-        ],
-        input=contents,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        [FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+         "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(SR), "pipe:1"],
+        input=contents, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
         raise ValueError(f"ffmpeg decode failed: {proc.stderr.decode(errors='ignore')}")
@@ -60,85 +73,68 @@ def decode_audio(contents: bytes, sr: int = 16000) -> np.ndarray:
     return y
 
 
+def preprocess(y: np.ndarray) -> np.ndarray:
+    """Identical to training: first 3 s, pad, 64-mel log spectrogram, min-max to 0-1."""
+    y = y[:TARGET_LEN]
+    if len(y) < TARGET_LEN:
+        y = np.pad(y, (0, TARGET_LEN - len(y)), mode="constant")
+    mel = librosa.feature.melspectrogram(y=y, sr=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS)
+    db = librosa.power_to_db(mel, ref=np.max)
+    norm = (db - db.min()) / (db.max() - db.min() + 1e-6)
+    return np.expand_dims(norm, axis=(0, -1)).astype(np.float32)  # (1, 64, T, 1)
+
+
 @app.get("/")
 def home():
-    return {"status": "Online", "message": "Infant Cry Classification Backend is running."}
+    return {"status": "Online", "model": MODEL_FILE, "labels": LABELS}
 
 
 @app.post("/predict")
 async def predict_cry(file: UploadFile = File(...)):
-    start_time = time.time()
-
+    start = time.perf_counter()
     try:
         if interpreter is None:
             raise RuntimeError("Model is not loaded.")
 
         contents = await file.read()
-        sr = 16000
-        y = decode_audio(contents, sr)
+        input_data = preprocess(decode_audio(contents))
 
-        # Extract Log-Mel Spectrogram
-        mel_spectrogram = librosa.feature.melspectrogram(
-            y=y, sr=sr, n_mels=64, n_fft=2048, hop_length=512
-        )
-        log_mel_spec = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        in_info = input_details[0]
+        if in_info["dtype"] == np.int8:
+            scale, zp = in_info["quantization"]
+            input_data = np.clip(np.round(input_data / scale + zp), -128, 127).astype(np.int8)
 
-        # Padding / Truncation
-        expected_frames = input_details[0]['shape'][2]
-
-        if log_mel_spec.shape[1] < expected_frames:
-            pad_width = expected_frames - log_mel_spec.shape[1]
-            log_mel_spec = np.pad(log_mel_spec, ((0, 0), (0, pad_width)), mode='constant')
-        else:
-            log_mel_spec = log_mel_spec[:, :expected_frames]
-
-        # [Batch, Height, Width, Channels]
-        input_data = np.expand_dims(log_mel_spec, axis=-1)
-        input_data = np.expand_dims(input_data, axis=0)
-
-        # INT8 input quantization
-        if input_details[0]['dtype'] == np.int8:
-            input_scale, input_zero_point = input_details[0]['quantization']
-            if input_scale > 0:
-                input_data = np.clip(
-                    np.round(input_data / input_scale + input_zero_point), -128, 127
-                ).astype(np.int8)
-            else:
-                input_data = input_data.astype(np.int8)
-        else:
-            input_data = input_data.astype(np.float32)
-
-        interpreter.set_tensor(input_details[0]['index'], input_data)
+        interpreter.set_tensor(in_info["index"], input_data)
         interpreter.invoke()
+        raw = interpreter.get_tensor(output_details[0]["index"])
 
-        output_data = interpreter.get_tensor(output_details[0]['index'])
+        out_info = output_details[0]
+        out = raw.astype(np.float32)
+        if out_info["dtype"] == np.int8:
+            scale, zp = out_info["quantization"]
+            out = (out - zp) * scale
+        out = out.flatten()
 
-        # INT8 output dequantization
-        if output_details[0]['dtype'] == np.int8:
-            output_scale, output_zero_point = output_details[0]['quantization']
-            output_data = (output_data.astype(np.float32) - output_zero_point) * output_scale
-
-        logits = output_data[0].astype(np.float32).flatten()
-
-        if logits.shape[0] > 1:
-            exp = np.exp(logits - np.max(logits))
-            probs = exp / exp.sum()
-            prediction_idx = int(np.argmax(probs))
-            confidence = float(np.max(probs))
+        # Outputs are already probabilities (sigmoid / softmax baked into the model)
+        if out.shape[0] == 1:                       # binary sigmoid: P(class 1)
+            p1 = float(np.clip(out[0], 0.0, 1.0))
+            probs = np.array([1.0 - p1, p1], dtype=np.float32)
         else:
-            p = float(1.0 / (1.0 + np.exp(-logits[0])))
-            prediction_idx = 1 if p >= 0.5 else 0
-            confidence = p if prediction_idx == 1 else 1.0 - p
+            probs = out
+            if np.any(probs < 0) or abs(float(probs.sum()) - 1.0) > 0.1:
+                e = np.exp(probs - probs.max())
+                probs = e / e.sum()
+            else:
+                probs = probs / probs.sum()
 
-        labels = ["Pathological", "Physiological"]
-        predicted_label = labels[prediction_idx] if prediction_idx < len(labels) else "Unknown"
-
-        latency_ms = (time.time() - start_time) * 1000
+        idx = int(np.argmax(probs))
+        label = LABELS[idx] if idx < len(LABELS) else "Unknown"
 
         return {
-            "prediction": predicted_label,
-            "confidence": confidence,
-            "latency_ms": latency_ms,
+            "prediction": label,
+            "confidence": float(probs[idx]),
+            "probabilities": {LABELS[i]: float(probs[i]) for i in range(min(len(LABELS), len(probs)))},
+            "latency_ms": (time.perf_counter() - start) * 1000,
         }
 
     except Exception as e:
