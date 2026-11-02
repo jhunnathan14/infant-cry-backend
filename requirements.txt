@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-tensorflow
-librosa
-numpy
 python-multipart
+numpy
+librosa
+tensorflow
+imageio-ffmpeg
